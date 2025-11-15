@@ -20,5 +20,8 @@ frontend/.turbo/
 infra/db_data/
 *.sqlite3
 
+# Docker / env
+infra/.env
+
 # Misc
 .envrc

@@ -9,8 +9,9 @@ services:
       MYSQL_DATABASE: rainsar_hub
       MYSQL_USER: rainsar
       MYSQL_PASSWORD: rainsar_pw
+    # ホスト側は 3307 に出す。port は環境変数でもよい
     ports:
-      - "3307:3306"
+      - "${DB_PORT_HOST:-3307}:3306"
     volumes:
       - db_data:/var/lib/mysql
 
@@ -20,15 +21,24 @@ services:
       dockerfile: ../infra/backend.Dockerfile
     container_name: rainsarhub-backend
     environment:
+      # DB は Docker ネットワーク内なので OS 非依存
       DB_HOST: db
       DB_PORT: 3306
       DB_USER: rainsar
       DB_PASSWORD: rainsar_pw
       DB_NAME: rainsar_hub
+      # GSMAP バイナリを見るルート（コンテナの中でのパス）
+      GSMAP_DATA_ROOT: /data/gsmap
     depends_on:
       - db
     ports:
       - "8000:8000"
+    volumes:
+      # ここでホストのパス差を吸収する
+      - type: bind
+        source: ${RAIN_DATA_ROOT}
+        target: /data/gsmap
+        read_only: true
 
   adminer:
     image: adminer
