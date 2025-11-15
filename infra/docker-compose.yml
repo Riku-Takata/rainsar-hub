@@ -1,0 +1,42 @@
+name: rainsar-hub
+
+services:
+  db:
+    image: mysql:8
+    container_name: rainsarhub-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rainsar_hub
+      MYSQL_USER: rainsar
+      MYSQL_PASSWORD: rainsar_pw
+    ports:
+      - "3307:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../infra/backend.Dockerfile
+    container_name: rainsarhub-backend
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: rainsar
+      DB_PASSWORD: rainsar_pw
+      DB_NAME: rainsar_hub
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+
+  adminer:
+    image: adminer
+    container_name: rainsarhub-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+
+volumes:
+  db_data:
