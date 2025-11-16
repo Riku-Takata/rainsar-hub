@@ -1,21 +1,30 @@
+# app/core/config.py
 from pathlib import Path
-
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # MySQL 接続設定
+    # MySQL
     DB_HOST: str = "127.0.0.1"
     DB_PORT: int = 3306
     DB_USER: str = "rainsar"
     DB_PASSWORD: str = "rainsar_pw"
     DB_NAME: str = "rainsar_hub"
 
-    # GSMAP バイナリのルートディレクトリ（コンテナ内パス or ローカル開発用）
+    # GSMAP バイナリのルート
     GSMAP_DATA_ROOT: str = "/data/gsmap"
 
+    # Copernicus Data Space (CDSE) 認証＆STAC
+    CDSE_CLIENT_ID: str | None = None
+    CDSE_CLIENT_SECRET: str | None = None
+    CDSE_TOKEN_URL: str = (
+        "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+    )
+    # ここは「search のフルURL」を渡す想定
+    CDSE_STAC_URL: str = "https://stac.dataspace.copernicus.eu/v1/search"
+
     class Config:
-        env_file = ".env"          # ローカル開発用（Docker 外で走らせるとき）
+        env_file = ".env"
         env_file_encoding = "utf-8"
 
     @property
