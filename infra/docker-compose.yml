@@ -13,7 +13,9 @@ services:
     ports:
       - "${DB_PORT_HOST:-3307}:3306"
     volumes:
-      - db_data:/var/lib/mysql
+      - type: bind
+        source: ${MYSQL_ROOT}
+        target: /var/lib/mysql
 
   backend:
     build:
@@ -39,6 +41,12 @@ services:
         source: ${RAIN_DATA_ROOT}
         target: /data/gsmap
         read_only: true
+      - type: bind
+        source: ${S1_SAFE_ROOT}
+        target: /data/s1_safe
+      - type: bind
+        source: ${S1_SAMPLE_ROOT}
+        target: /data/s1_samples
 
   adminer:
     image: adminer

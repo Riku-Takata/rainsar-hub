@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # GSMAP バイナリのルート
     GSMAP_DATA_ROOT: str = "/data/gsmap"
 
+    S1_SAFE_ROOT: str = "/data/s1_safe"
+
+    S1_SAMPLE_ROOT: str = "/data/s1_samples"
+
     # Copernicus Data Space (CDSE) 認証＆STAC
     CDSE_CLIENT_ID: str | None = None
     CDSE_CLIENT_SECRET: str | None = None
@@ -37,6 +41,13 @@ class Settings(BaseSettings):
     @property
     def gsmap_data_path(self) -> Path:
         return Path(self.GSMAP_DATA_ROOT)
+    
+    @property
+    def s1_safe_path(self) -> Path:
+        return Path(self.S1_SAFE_ROOT)
 
+    @property
+    def s1_sample_path(self) -> Path:
+        return Path(self.S1_SAMPLE_ROOT)
 
 settings = Settings()

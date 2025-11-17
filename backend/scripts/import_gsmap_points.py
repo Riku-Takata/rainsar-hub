@@ -16,9 +16,12 @@ FTP などで取得した GSMaP Gauge v8 hourly のバイナリ
 使い方例 (コンテナ内):
 
   root@backend:/app# python -m scripts.import_gsmap_points \
-        --min-lat 20 --max-lat 50 \
+        --root /data/gsmap \
+        --min-lat 20 --max-lat 48 \
         --min-lon 120 --max-lon 150 \
-        --min-gauge-mm-h 4
+        --min-gauge-mm-h 7 \
+        --start-year 2018 --end-year 2020 \
+        --workers 4
 """
 
 from __future__ import annotations
@@ -27,9 +30,11 @@ import argparse
 import gzip
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Optional
 
 import numpy as np
 from sqlalchemy import select
@@ -45,19 +50,25 @@ logger = logging.getLogger(__name__)
 FNAME_RE = re.compile(r"gsmap_gauge\.(\d{8})\.(\d{4})\.v8\..*\.dat\.gz$")
 
 
+# ----------------------------------------------------------------------
+# 引数
+# ----------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--root",
         type=str,
         default=str(settings.gsmap_data_path),
         help="GSMAP バイナリのルートディレクトリ（YYYY/MM/DD/*.dat.gz がぶら下がる）",
     )
+
     # 日本周辺 bbox（必要に応じて調整）
     parser.add_argument("--min-lat", type=float, default=20.0)
     parser.add_argument("--max-lat", type=float, default=50.0)
     parser.add_argument("--min-lon", type=float, default=120.0)
     parser.add_argument("--max-lon", type=float, default=150.0)
+
     # 0 ばかり入るのを避けるためのしきい値（mm/h）
     parser.add_argument(
         "--min-gauge-mm-h",
@@ -65,24 +76,67 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="この値 (mm/h) 未満の格子は登録しない（デフォルト: 0.0）",
     )
+
+    # 対象年の絞り込み
+    parser.add_argument(
+        "--start-year",
+        type=int,
+        default=None,
+        help="この年以降のファイルのみ対象（YYYY）。未指定なら制限なし。",
+    )
+    parser.add_argument(
+        "--end-year",
+        type=int,
+        default=None,
+        help="この年までのファイルのみ対象（YYYY）。未指定なら制限なし。",
+    )
+
+    # 並列ワーカー数
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="ThreadPoolExecutor のワーカー数（デフォルト: 1=シングルスレッド）",
+    )
+
     return parser.parse_args()
 
 
-def iter_dat_files(root: Path) -> Iterable[Path]:
+# ----------------------------------------------------------------------
+# ファイル列挙
+# ----------------------------------------------------------------------
+def iter_dat_files(
+    root: Path,
+    start_year: Optional[int] = None,
+    end_year: Optional[int] = None,
+) -> Iterable[Path]:
     """
-    root/YYYY/MM/DD/*.dat.gz を順に yield
-    OS 依存しないように Path.glob を使う。
+    root/YYYY/MM/DD/*.dat.gz を順に yield。
+    start_year / end_year が指定されていれば、その範囲に含まれる年だけ。
     """
     if not root.exists():
         raise FileNotFoundError(f"GSMAP_DATA_ROOT not found: {root}")
 
     for year_dir in sorted(root.glob("[0-9][0-9][0-9][0-9]")):
+        try:
+            year = int(year_dir.name)
+        except ValueError:
+            continue
+
+        if start_year is not None and year < start_year:
+            continue
+        if end_year is not None and year > end_year:
+            continue
+
         for month_dir in sorted(year_dir.glob("[0-1][0-9]")):
             for day_dir in sorted(month_dir.glob("[0-3][0-9]")):
                 for f in sorted(day_dir.glob("*.dat.gz")):
                     yield f
 
 
+# ----------------------------------------------------------------------
+# 1ファイル読み込み
+# ----------------------------------------------------------------------
 def load_one_dat_gz(path: Path) -> Tuple[datetime, np.ndarray, np.ndarray, np.ndarray]:
     """
     1 つの GSMaP Gauge v8 hourly dat.gz を読み込んで、
@@ -140,6 +194,9 @@ def load_one_dat_gz(path: Path) -> Tuple[datetime, np.ndarray, np.ndarray, np.nd
     return ts, lat2d, lon2d, gauge
 
 
+# ----------------------------------------------------------------------
+# 1ファイルぶん DB への insert
+# ----------------------------------------------------------------------
 def insert_points_for_file(
     db: Session,
     ts_utc: datetime,
@@ -197,6 +254,68 @@ def insert_points_for_file(
     return count
 
 
+# ----------------------------------------------------------------------
+# スレッド 1本が 1ファイルを処理する関数
+# ----------------------------------------------------------------------
+def process_one_file(
+    root: Path,
+    f: Path,
+    *,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    min_gauge_mm_h: float,
+) -> tuple[str, int]:
+    """
+    1つの dat.gz ファイルをパースして DB に insert する。
+    スレッドごとに独立した SessionLocal() を生成。
+    """
+    rel_path = str(f.relative_to(root))
+    tname = threading.current_thread().name
+
+    with SessionLocal() as db:
+        # 再実行安全: すでに同じ source_file があればスキップ
+        exists = db.execute(
+            select(models.GsmapPoint.id).where(
+                models.GsmapPoint.source_file == rel_path
+            )
+        ).first()
+        if exists:
+            logger.info("[thread %s] [skip] already imported: %s", tname, rel_path)
+            return rel_path, 0
+
+        logger.info("[thread %s] importing %s", tname, rel_path)
+
+        ts_utc, lat2d, lon2d, gauge_mm_h = load_one_dat_gz(f)
+
+        inserted = insert_points_for_file(
+            db,
+            ts_utc=ts_utc,
+            lat2d=lat2d,
+            lon2d=lon2d,
+            gauge_mm_h=gauge_mm_h,
+            min_lat=min_lat,
+            max_lat=max_lat,
+            min_lon=min_lon,
+            max_lon=max_lon,
+            min_gauge_mm_h=min_gauge_mm_h,
+            source_file=rel_path,
+        )
+        db.commit()
+
+        logger.info(
+            "[thread %s] done %s -> inserted %d rows",
+            tname,
+            rel_path,
+            inserted,
+        )
+        return rel_path, inserted
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -205,49 +324,72 @@ def main() -> None:
 
     args = parse_args()
     root = Path(args.root)
+
     logger.info("GSMAP root: %s", root)
+    logger.info(
+        "bbox: lat=[%.2f, %.2f], lon=[%.2f, %.2f], min_gauge_mm_h=%.2f",
+        args.min_lat,
+        args.max_lat,
+        args.min_lon,
+        args.max_lon,
+        args.min_gauge_mm_h,
+    )
+    logger.info(
+        "year range: %s - %s (None=unlimited), workers=%d",
+        args.start_year,
+        args.end_year,
+        args.workers,
+    )
 
-    with SessionLocal() as db:
-        for idx, f in enumerate(iter_dat_files(root), start=1):
-            rel_path = str(f.relative_to(root))
+    files = list(iter_dat_files(root, args.start_year, args.end_year))
+    total_files = len(files)
+    if total_files == 0:
+        logger.warning("No .dat.gz files found under %s", root)
+        return
 
-            # 再実行安全: すでに同じ source_file があればスキップ
-            exists = db.execute(
-                select(models.GsmapPoint.id).where(
-                    models.GsmapPoint.source_file == rel_path
-                )
-            ).first()
-            if exists:
-                logger.info("[skip] already imported: %s", rel_path)
-                continue
+    logger.info("found %d dat.gz files in target year range", total_files)
 
-            logger.info("[%d] importing %s", idx, rel_path)
+    total_inserted = 0
+    processed = 0
 
+    # 並列処理
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_file = {
+            executor.submit(
+                process_one_file,
+                root,
+                f,
+                min_lat=args.min_lat,
+                max_lat=args.max_lat,
+                min_lon=args.min_lon,
+                max_lon=args.max_lon,
+                min_gauge_mm_h=args.min_gauge_mm_h,
+            ): f
+            for f in files
+        }
+
+        for future in as_completed(future_to_file):
+            f = future_to_file[future]
             try:
-                ts_utc, lat2d, lon2d, gauge_mm_h = load_one_dat_gz(f)
+                rel_path, inserted = future.result()
+                total_inserted += inserted
             except Exception as e:  # noqa: BLE001
-                logger.exception("failed to parse %s: %s", f, e)
-                continue
+                logger.exception("failed to process %s: %s", f, e)
+            finally:
+                processed += 1
+                if processed % 10 == 0 or processed == total_files:
+                    logger.info(
+                        "progress: %d/%d files processed, total_inserted=%d",
+                        processed,
+                        total_files,
+                        total_inserted,
+                    )
 
-            try:
-                inserted = insert_points_for_file(
-                    db,
-                    ts_utc=ts_utc,
-                    lat2d=lat2d,
-                    lon2d=lon2d,
-                    gauge_mm_h=gauge_mm_h,
-                    min_lat=args.min_lat,
-                    max_lat=args.max_lat,
-                    min_lon=args.min_lon,
-                    max_lon=args.max_lon,
-                    min_gauge_mm_h=args.min_gauge_mm_h,
-                    source_file=rel_path,
-                )
-                db.commit()
-                logger.info("  -> inserted %d rows for %s", inserted, rel_path)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("failed to insert rows for %s: %s", f, e)
-                db.rollback()
+    logger.info(
+        "all done. processed=%d files, total_inserted=%d rows",
+        processed,
+        total_inserted,
+    )
 
 
 if __name__ == "__main__":

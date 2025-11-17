@@ -15,15 +15,23 @@ gsmap_points から「連続降雨イベント」を抽出して gsmap_events �
 
 使い方 (コンテナ内):
 
-  root@backend:/app# python -m scripts.build_gsmap_events \
-        --threshold-mm-h 4 \
-        --start-date 2018-01-01 \
+  root@backend:/app# python -m scripts.build_gsmap_events \\
+        --threshold-mm-h 4 \\
+        --start-date 2018-01-01 \\
         --end-date 2018-12-31
 
   # 既存のイベントを消さずに、件数だけ確認したい場合:
-  root@backend:/app# python -m scripts.build_gsmap_events \
-        --threshold-mm-h 4 \
+  root@backend:/app# python -m scripts.build_gsmap_events \\
+        --threshold-mm-h 4 \\
         --dry-run
+
+  # 日本付近の bbox だけ対象にする場合(例):
+  root@backend:/app# python -m scripts.build_gsmap_events \\
+        --threshold-mm-h 4 \\
+        --start-date 2018-01-01 \\
+        --end-date 2018-12-31 \\
+        --min-lat 24 --max-lat 46 \\
+        --min-lon 123 --max-lon 146
 """
 
 from __future__ import annotations
@@ -45,7 +53,9 @@ logger = logging.getLogger(__name__)
 # CLI 引数
 # ----------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="gsmap_points から連続降雨イベントを生成して gsmap_events に保存する")
+    ap = argparse.ArgumentParser(
+        description="gsmap_points から連続降雨イベントを生成して gsmap_events に保存する"
+    )
 
     ap.add_argument(
         "--threshold-mm-h",
@@ -78,7 +88,34 @@ def parse_args() -> argparse.Namespace:
         "--yield-per",
         type=int,
         default=10000,
-        help="gsmap_points をストリーム取得するときのバッチサイズ (ORM の yield_per, デフォルト: 10000)",
+        help="gsmap_points をストリーム取得するときのバッチサイズ "
+             "(ORM の yield_per, デフォルト: 10000)",
+    )
+
+    # ★ 追加: 日本国土などに絞りたいときの bbox オプション
+    ap.add_argument(
+        "--min-lat",
+        type=float,
+        default=None,
+        help="緯度下限。指定した場合、この値以上の地点のみ対象 (例: 24.0)。未指定なら制限なし。",
+    )
+    ap.add_argument(
+        "--max-lat",
+        type=float,
+        default=None,
+        help="緯度上限。指定した場合、この値以下の地点のみ対象 (例: 46.0)。未指定なら制限なし。",
+    )
+    ap.add_argument(
+        "--min-lon",
+        type=float,
+        default=None,
+        help="経度下限。指定した場合、この値以上の地点のみ対象 (例: 123.0)。未指定なら制限なし。",
+    )
+    ap.add_argument(
+        "--max-lon",
+        type=float,
+        default=None,
+        help="経度上限。指定した場合、この値以下の地点のみ対象 (例: 146.0)。未指定なら制限なし。",
     )
 
     return ap.parse_args()
@@ -165,9 +202,18 @@ def main() -> None:
         end_dt,
         args.dry_run,
     )
+    logger.info(
+        "bbox filter: min_lat=%s, max_lat=%s, min_lon=%s, max_lon=%s",
+        args.min_lat,
+        args.max_lat,
+        args.min_lon,
+        args.max_lon,
+    )
 
     with SessionLocal() as db:
-        # まず既存のイベントを削除（同じ threshold & 期間のみ）
+        # --------------------------------------------------------------
+        # 1) 既存のイベントを削除（同じ threshold & 期間 & bbox のみ）
+        # --------------------------------------------------------------
         if not args.dry_run:
             q_del = db.query(models.GsmapEvent).filter(
                 models.GsmapEvent.threshold_mm_h == args.threshold_mm_h
@@ -176,11 +222,24 @@ def main() -> None:
                 q_del = q_del.filter(models.GsmapEvent.start_ts_utc >= start_dt)
             if end_dt is not None:
                 q_del = q_del.filter(models.GsmapEvent.start_ts_utc < end_dt)
+
+            # ★ bbox が指定されていれば、イベント側にも同じ条件を適用
+            if args.min_lat is not None:
+                q_del = q_del.filter(models.GsmapEvent.lat >= args.min_lat)
+            if args.max_lat is not None:
+                q_del = q_del.filter(models.GsmapEvent.lat <= args.max_lat)
+            if args.min_lon is not None:
+                q_del = q_del.filter(models.GsmapEvent.lon >= args.min_lon)
+            if args.max_lon is not None:
+                q_del = q_del.filter(models.GsmapEvent.lon <= args.max_lon)
+
             deleted = q_del.delete(synchronize_session=False)
             db.commit()
             logger.info("deleted old events: %d rows", deleted)
 
-        # gsmap_points を grid_id, ts_utc 順にストリーム取得
+        # --------------------------------------------------------------
+        # 2) gsmap_points を grid_id, ts_utc 順にストリーム取得
+        # --------------------------------------------------------------
         query = db.query(
             models.GsmapPoint.grid_id,
             models.GsmapPoint.lat,
@@ -197,6 +256,16 @@ def main() -> None:
             query = query.filter(models.GsmapPoint.ts_utc >= start_dt)
         if end_dt is not None:
             query = query.filter(models.GsmapPoint.ts_utc < end_dt)
+
+        # ★ bbox が指定されていれば、ポイント側にも同じ条件を適用
+        if args.min_lat is not None:
+            query = query.filter(models.GsmapPoint.lat >= args.min_lat)
+        if args.max_lat is not None:
+            query = query.filter(models.GsmapPoint.lat <= args.max_lat)
+        if args.min_lon is not None:
+            query = query.filter(models.GsmapPoint.lon >= args.min_lon)
+        if args.max_lon is not None:
+            query = query.filter(models.GsmapPoint.lon <= args.max_lon)
 
         query = query.order_by(
             models.GsmapPoint.grid_id,
