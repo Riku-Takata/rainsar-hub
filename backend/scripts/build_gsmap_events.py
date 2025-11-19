@@ -15,6 +15,11 @@ gsmap_points から「連続降雨イベント」を抽出して gsmap_events �
 
 使い方 (コンテナ内):
 
+  # 全期間・全世界（インポート済み範囲）からイベント作成
+  root@backend:/app# python -m scripts.build_gsmap_events \\
+        --threshold-mm-h 4
+
+  # 2018 年だけ対象
   root@backend:/app# python -m scripts.build_gsmap_events \\
         --threshold-mm-h 4 \\
         --start-date 2018-01-01 \\
@@ -32,6 +37,13 @@ gsmap_points から「連続降雨イベント」を抽出して gsmap_events �
         --end-date 2018-12-31 \\
         --min-lat 24 --max-lat 46 \\
         --min-lon 123 --max-lon 146
+
+  # さらに「日本国土ポリゴン」でマスクする場合:
+  root@backend:/app# python -m scripts.build_gsmap_events \\
+        --threshold-mm-h 10 \\
+        --min-lat 20 --max-lat 50 \\
+        --min-lon 120 --max-lon 150 \\
+        --japan-mask
 """
 
 from __future__ import annotations
@@ -39,7 +51,18 @@ from __future__ import annotations
 import argparse
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
+
+import requests
+
+try:
+    import geopandas as gpd
+except ImportError:
+    gpd = None
+
+from shapely.geometry import Point
+from shapely.ops import unary_union
 
 from sqlalchemy.orm import Session
 
@@ -47,6 +70,87 @@ from app.db.session import SessionLocal
 from app.db import models
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Natural Earth から日本ポリゴンを取得するための設定
+# ----------------------------------------------------------------------
+
+# Natural Earth admin_0_countries (10m) の CDN URL
+NE_ADMIN0_URL = (
+    "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_countries.zip"
+)
+
+# コンテナ内でのキャッシュ先
+NE_ADMIN0_CACHE = Path("/tmp/ne_10m_admin_0_countries.zip")
+
+
+def _ensure_admin0_zip() -> Path:
+    """
+    Natural Earth の admin_0_countries ZIP を /tmp にキャッシュして返す。
+
+    - 既に /tmp/ne_10m_admin_0_countries.zip があればそれを使う
+    - なければ NE_ADMIN0_URL からダウンロード
+    - ダウンロード失敗時は RuntimeError を投げて、手動配置を案内
+    """
+    if NE_ADMIN0_CACHE.exists():
+        logger.info("using cached Natural Earth admin_0_countries: %s", NE_ADMIN0_CACHE)
+        return NE_ADMIN0_CACHE
+
+    logger.info("downloading Natural Earth admin_0_countries from: %s", NE_ADMIN0_URL)
+    try:
+        resp = requests.get(NE_ADMIN0_URL, stream=True, timeout=120)
+        resp.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        logger.error("failed to download Natural Earth admin_0_countries: %s", e)
+        raise RuntimeError(
+            "Failed to download Natural Earth admin_0_countries.\n"
+            f"  URL: {NE_ADMIN0_URL}\n"
+            "手動でこの ZIP をダウンロードして、コンテナ内の\n"
+            "  /tmp/ne_10m_admin_0_countries.zip\n"
+            "に配置してから再実行してください。"
+        ) from e
+
+    with open(NE_ADMIN0_CACHE, "wb") as f:
+        for chunk in resp.iter_content(1024 * 1024):
+            if not chunk:
+                continue
+            f.write(chunk)
+
+    logger.info("saved Natural Earth admin_0_countries to: %s", NE_ADMIN0_CACHE)
+    return NE_ADMIN0_CACHE
+
+
+def get_japan_polygon():
+    """
+    Natural Earth admin_0_countries から日本 (ADM0_A3 == 'JPN') のポリゴンを取得して返す。
+
+    - CRS は WGS84 (EPSG:4326) に揃える
+    - マルチポリゴンは unary_union で 1 個の geometry にまとめる
+    """
+    if gpd is None:
+        raise RuntimeError(
+            "geopandas がインストールされていないため --japan-mask は使用できません。\n"
+            "backend コンテナ内で `pip install geopandas shapely` などを実行してください。"
+        )
+
+    zip_path = _ensure_admin0_zip()
+    logger.info("loading Natural Earth admin_0_countries from: %s", zip_path)
+
+    # geopandas は zip:// パスを直接読める
+    world = gpd.read_file(f"zip://{zip_path}")
+
+    # Natural Earth の日本は ADM0_A3 == 'JPN' でフィルタするのが定番
+    jp = world[world["ADM0_A3"] == "JPN"]
+    if jp.empty:
+        raise RuntimeError("Natural Earth admin_0_countries に ADM0_A3 == 'JPN' が見つかりません。")
+
+    # 念のため WGS84 に揃える
+    jp = jp.to_crs(epsg=4326)
+
+    # 複数ポリゴンを一つにまとめる
+    geom = unary_union(jp.geometry)
+    logger.info("Japan polygon loaded (type=%s)", geom.geom_type)
+    return geom
 
 
 # ----------------------------------------------------------------------
@@ -88,11 +192,13 @@ def parse_args() -> argparse.Namespace:
         "--yield-per",
         type=int,
         default=10000,
-        help="gsmap_points をストリーム取得するときのバッチサイズ "
-             "(ORM の yield_per, デフォルト: 10000)",
+        help=(
+            "gsmap_points をストリーム取得するときのバッチサイズ "
+            "(ORM の yield_per, デフォルト: 10000)"
+        ),
     )
 
-    # ★ 追加: 日本国土などに絞りたいときの bbox オプション
+    # bbox フィルタ（任意）
     ap.add_argument(
         "--min-lat",
         type=float,
@@ -116,6 +222,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="経度上限。指定した場合、この値以下の地点のみ対象 (例: 146.0)。未指定なら制限なし。",
+    )
+
+    # 日本ポリゴンによるマスク
+    ap.add_argument(
+        "--japan-mask",
+        action="store_true",
+        help="日本国土ポリゴン（Natural Earth）内の格子点のみを対象にする",
     )
 
     return ap.parse_args()
@@ -196,11 +309,12 @@ def main() -> None:
         end_dt = datetime.strptime(args.end_date, "%Y-%m-%d") + timedelta(days=1)
 
     logger.info(
-        "build_gsmap_events: threshold=%.3f, start=%s, end=%s, dry_run=%s",
+        "build_gsmap_events: threshold=%.3f, start=%s, end=%s, dry_run=%s, japan_mask=%s",
         args.threshold_mm_h,
         start_dt,
         end_dt,
         args.dry_run,
+        args.japan_mask,
     )
     logger.info(
         "bbox filter: min_lat=%s, max_lat=%s, min_lon=%s, max_lon=%s",
@@ -210,9 +324,15 @@ def main() -> None:
         args.max_lon,
     )
 
+    # 日本ポリゴンの事前ロード（エラーなら早めに落ちる）
+    jp_geom = None
+    if args.japan_mask:
+        jp_geom = get_japan_polygon()
+
     with SessionLocal() as db:
         # --------------------------------------------------------------
         # 1) 既存のイベントを削除（同じ threshold & 期間 & bbox のみ）
+        #    ※ japan_mask は SQL で適用できないので、ここでは考慮しない。
         # --------------------------------------------------------------
         if not args.dry_run:
             q_del = db.query(models.GsmapEvent).filter(
@@ -223,7 +343,6 @@ def main() -> None:
             if end_dt is not None:
                 q_del = q_del.filter(models.GsmapEvent.start_ts_utc < end_dt)
 
-            # ★ bbox が指定されていれば、イベント側にも同じ条件を適用
             if args.min_lat is not None:
                 q_del = q_del.filter(models.GsmapEvent.lat >= args.min_lat)
             if args.max_lat is not None:
@@ -257,7 +376,7 @@ def main() -> None:
         if end_dt is not None:
             query = query.filter(models.GsmapPoint.ts_utc < end_dt)
 
-        # ★ bbox が指定されていれば、ポイント側にも同じ条件を適用
+        # bbox フィルタ（ある場合のみ）
         if args.min_lat is not None:
             query = query.filter(models.GsmapPoint.lat >= args.min_lat)
         if args.max_lat is not None:
@@ -300,6 +419,12 @@ def main() -> None:
             # grid_id が NULL のものはスキップ（通常はない想定）
             if grid_id is None:
                 continue
+
+            # 日本ポリゴン外ならスキップ
+            if jp_geom is not None:
+                # lon, lat の順で Point を作る（Geo は x=lon, y=lat）
+                if not Point(float(lon), float(lat)).within(jp_geom):
+                    continue
 
             if cur_grid_id is None:
                 # 最初のレコード
@@ -411,12 +536,13 @@ def main() -> None:
             db.commit()
 
         logger.info(
-            "done. total_events=%d, inserted_events=%d (threshold=%.3f, period=%s..%s)",
+            "done. total_events=%d, inserted_events=%d (threshold=%.3f, period=%s..%s, japan_mask=%s)",
             total_events,
             inserted_events,
             args.threshold_mm_h,
             start_dt,
             end_dt,
+            args.japan_mask,
         )
 
 

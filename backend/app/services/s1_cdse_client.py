@@ -43,7 +43,7 @@ class S1Scene:
     properties: Dict[str, Any]
 
 
-class S1CdseClient:
+class S1CDSEClient:
     """
     Copernicus Data Space Ecosystem (CDSE) の STAC API を叩いて
     Sentinel-1 GRD シーンを検索するクライアント。
