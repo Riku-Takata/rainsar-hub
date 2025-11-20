@@ -33,37 +33,39 @@ interface RainEvent {
 
 // --- Download Button ---
 function DownloadControl({ productId, gridId }: { productId: string, gridId: string }) {
-  const [status, setStatus] = useState<"not_started" | "downloading" | "completed">("not_started");
+  // ステータスに processing, processed, failed を追加
+  const [status, setStatus] = useState<string>("not_started");
   const [progress, setProgress] = useState(0);
 
   useEffect(() => {
     let intervalId: NodeJS.Timeout;
     const checkStatus = async () => {
       try {
-        // grid_id も渡して確認
         const res = await fetch(`http://localhost:8000/download/status/${productId}?grid_id=${gridId}`);
         if (res.ok) {
           const data = await res.json();
           setStatus(data.status);
           setProgress(data.progress);
+          
+          // processed または failed ならポーリング停止してもよいが、
+          // ページを開いたまま再実行する場合もあるので回しておいても良い
         }
       } catch (e) { console.error(e); }
     };
     checkStatus();
-    intervalId = setInterval(checkStatus, 1000);
+    intervalId = setInterval(checkStatus, 1500);
     return () => clearInterval(intervalId);
   }, [productId, gridId]);
 
   const handleStart = async () => {
     if(!confirm(`Download this product?\n${productId}`)) return;
     try {
-      // grid_id をパラメータに追加
       const res = await fetch(`http://localhost:8000/download/product?product_id=${productId}&grid_id=${gridId}`, { method: "POST" });
       if (res.ok) {
         setStatus("downloading");
         setProgress(0);
       }
-    } catch(e) { console.error(e); alert("Error starting download"); }
+    } catch(e) { console.error(e); alert("Error"); }
   };
 
   const handleCancel = async () => {
@@ -74,13 +76,39 @@ function DownloadControl({ productId, gridId }: { productId: string, gridId: str
     } catch(e) { console.error(e); }
   };
 
-  if (status === "completed") {
+  // --- UI Rendering ---
+
+  if (status === "processed") {
     return (
-      <div className="flex items-center">
-        <span className="text-xs font-bold text-green-600 bg-green-100 border border-green-200 px-3 py-1.5 rounded">
-          ✓ Downloaded
-        </span>
+      <span className="text-xs font-bold text-white bg-blue-600 border border-blue-700 px-3 py-1.5 rounded shadow-sm">
+        ✓ Processed
+      </span>
+    );
+  }
+
+  if (status === "processing") {
+    return (
+      <div className="flex items-center gap-2 text-blue-600 bg-blue-50 px-3 py-1 rounded border border-blue-100">
+        <div className="animate-spin rounded-full h-3 w-3 border-2 border-blue-600 border-t-transparent"></div>
+        <span className="text-xs font-bold">Processing...</span>
       </div>
+    );
+  }
+
+  if (status === "downloaded") {
+    return (
+       <div className="flex items-center gap-2 text-orange-600 bg-orange-50 px-3 py-1 rounded border border-orange-100">
+         <span className="text-xs font-bold">Waiting for SNAP...</span>
+       </div>
+    );
+  }
+
+  if (status === "failed") {
+    return (
+       <div className="flex items-center gap-2">
+         <span className="text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded">Failed</span>
+         <button onClick={handleStart} className="text-xs underline text-gray-500">Retry</button>
+       </div>
     );
   }
 
@@ -99,6 +127,13 @@ function DownloadControl({ productId, gridId }: { productId: string, gridId: str
         <button onClick={handleCancel} className="text-red-500 hover:text-red-700 text-xs font-bold px-2">Cancel</button>
       </div>
     );
+  }
+
+  // completed (downloaded but not processed logic handling above covered 'downloaded', 'completed' usually means same)
+  if (status === "completed") {
+     // In this logic, "completed" from API might map to "downloaded" state if file exists but processing not started/finished
+     // or API might return "downloaded". Assuming API returns "downloaded" for raw file presence.
+     return <span className="text-xs font-bold text-green-600">Downloaded</span>;
   }
 
   return (

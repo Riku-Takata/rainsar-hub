@@ -1,5 +1,6 @@
 # backend/app/api/grids.py
 
+import json
 from typing import List, Optional, Dict, Any, Set
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,7 +63,7 @@ class RainEventResponse(BaseModel):
     class Config: from_attributes = True
 
 class DownloadStatusResponse(BaseModel):
-    status: str
+    status: str  # not_started, downloading, downloaded, processing, processed, failed
     progress: float
 
 # --- State Management ---
@@ -90,12 +91,7 @@ def get_grid_stats(min_rain: float = 1.0, db: Session = Depends(get_db)):
     return stmt.all()
 
 @router.get("/grids/{grid_id}/events", response_model=List[RainEventResponse])
-def get_grid_rain_events(
-    grid_id: str, 
-    limit: int = 10000, 
-    min_rain: float = 1.0,
-    db: Session = Depends(get_db)
-):
+def get_grid_rain_events(grid_id: str, limit: int = 10000, min_rain: float = 1.0, db: Session = Depends(get_db)):
     points = (
         db.query(models.GsmapPoint)
         .filter(models.GsmapPoint.grid_id == grid_id, models.GsmapPoint.gauge_mm_h >= min_rain)
@@ -125,7 +121,6 @@ def get_grid_rain_events(
     for i, ev in enumerate(reversed(events_list)):
         pair = pairs_map.get(ev["start"])
         sat_info = SatelliteInfo(found=False, searched=False)
-        
         if pair:
             after_meta = SceneMetadata(
                 file_name=pair.after_scene_id,
@@ -190,15 +185,8 @@ def search_satellite_for_event(
             db.commit()
     
     client = S1CDSEClient()
-    
-    after_scene = client.find_after_scene(
-        lat=lat, lon=lon, 
-        event_end_utc=event_end, 
-        after_hours=12.0
-    )
-    
-    if not after_scene:
-        return SatelliteInfo(found=False, searched=True)
+    after_scene = client.find_after_scene(lat=lat, lon=lon, event_end_utc=event_end, after_hours=12.0)
+    if not after_scene: return SatelliteInfo(found=False, searched=True)
     
     before_scene = client.find_before_scene_unbounded(
         lat=lat, lon=lon, 
@@ -207,9 +195,7 @@ def search_satellite_for_event(
         orbit_direction=after_scene.orbit_direction,
         relative_orbit=after_scene.relative_orbit
     )
-    
-    if not before_scene:
-        return SatelliteInfo(found=False, searched=True)
+    if not before_scene: return SatelliteInfo(found=False, searched=True)
         
     delay_sec = (after_scene.acquisition_time - event_end).total_seconds()
     delay_h = round(delay_sec / 3600.0, 2)
@@ -249,12 +235,12 @@ def search_satellite_for_event(
         after=after_meta, before=before_meta
     )
 
-# --- Download Logic ---
+# --- Download & Status Logic ---
 
 @router.post("/download/product")
 def download_single_product(
     product_id: str, 
-    grid_id: str = Query(..., description="Grid ID for directory structure"), # grid_id を受け取る
+    grid_id: str = Query(..., description="Grid ID for directory structure"),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if product_id in cancellation_requests:
@@ -273,30 +259,47 @@ def cancel_download(product_id: str):
 
 @router.get("/download/status/{product_id}", response_model=DownloadStatusResponse)
 def get_download_status(product_id: str, grid_id: Optional[str] = None):
+    client = S1CDSEClient()
+    stem = client._normalize_product_name(product_id)
+    
+    # 1. まず「前処理済み(Processed)」をチェック
+    # s1_samples/{grid_id}/{stem}_proc.tif
+    if grid_id:
+        proc_path = settings.s1_sample_path / grid_id / f"{stem}_proc.tif"
+        if proc_path.exists() and proc_path.stat().st_size > 0:
+            return {"status": "processed", "progress": 100.0}
+
+    # 2. 「処理中(Processing)」または「失敗(Failed)」をチェック
+    # s1_samples/_status/{grid_id}___{stem}.json
+    if grid_id:
+        status_file = settings.s1_sample_path / "_status" / f"{grid_id}___{stem}.json"
+        if status_file.exists():
+            try:
+                with open(status_file, "r") as f:
+                    info = json.load(f)
+                st = info.get("status", "processing")
+                return {"status": st, "progress": 100.0}
+            except:
+                pass
+
+    # 3. 「ダウンロード中(Downloading)」をチェック
     if product_id in download_tasks:
         return {"status": "downloading", "progress": download_tasks[product_id]}
     
-    client = S1CDSEClient()
-    safe_name = client._normalize_product_name(product_id) + ".zip"
-    
-    # 既存ファイルチェック (grid_id/raw 優先)
-    target_paths = []
-    if grid_id:
-        target_paths.append(settings.s1_sample_path / grid_id / "raw" / safe_name)
-    target_paths.append(settings.s1_safe_path / safe_name)
-
-    for path in target_paths:
-        if path.exists() and path.stat().st_size > 0:
-            return {"status": "completed", "progress": 100.0}
+    # 4. 「ダウンロード完了(Downloaded)」をチェック (Rawファイルがあるか)
+    zip_name = stem + ".zip"
+    raw_path = settings.s1_safe_path / zip_name
+    if raw_path.exists() and raw_path.stat().st_size > 0:
+        # rawはあるがprocessedがない場合 -> downloaded (waiting for process)
+        return {"status": "downloaded", "progress": 100.0}
         
     return {"status": "not_started", "progress": 0.0}
 
 def run_download(product_id: str, grid_id: str):
     client = S1CDSEClient()
-    # 保存先: s1_samples/{grid_id}/raw
-    save_dir = settings.s1_sample_path / grid_id / "raw"
+    save_dir = settings.s1_safe_path
     
-    # トリガー出力先: s1_samples/_triggers
+    # トリガー出力先
     trigger_dir = settings.s1_sample_path / "_triggers"
     trigger_dir.mkdir(parents=True, exist_ok=True)
 
@@ -312,11 +315,11 @@ def run_download(product_id: str, grid_id: str):
         saved_path = client.download_product(product_id, save_dir, progress_callback=progress_cb)
         
         if saved_path:
-            # 完了トリガー作成: {grid_id}___{safe_stem}.req
+            # 完了時: トリガーファイル作成
             safe_stem = saved_path.stem.replace(".SAFE", "")
             trigger_file = trigger_dir / f"{grid_id}___{safe_stem}.req"
             trigger_file.touch()
-
+            
     finally:
         if product_id in download_tasks:
             del download_tasks[product_id]
