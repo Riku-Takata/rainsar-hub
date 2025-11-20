@@ -1,11 +1,12 @@
-# app/services/s1_cdse_client.py
+# backend/app/services/s1_cdse_client.py
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Callable
+from pathlib import Path
+import shutil
 import logging
 import requests
 
@@ -17,67 +18,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class S1Scene:
-    """
-    Sentinel-1 GRD シーンのメタデータ（最低限）
-
-    - stac_id: STAC アイテムの ID（例: ..._COG）
-    - product_identifier: 元の L1 GRD SAFE 製品名
-        例: S1B_IW_GRDH_1SDV_20180706T084948_20180706T084959_011688_0157FB_C8CD.SAFE
-    """
-
-    # STAC アイテム ID (COG 名。UI での表示や STAC への参照用)
     stac_id: str
-
-    # 元の SAFE プロダクト名 (s1:product_identifier)
     product_identifier: Optional[str]
-
-    # 代表的なメタ情報
     acquisition_time: datetime
     orbit_direction: Optional[str]
     relative_orbit: Optional[int]
     platform: Optional[str]
     product_type: Optional[str]
-
-    # ジオメトリ・プロパティ一式
     geometry: Dict[str, Any]
     properties: Dict[str, Any]
+    assets: Dict[str, Any]
 
 
 class S1CDSEClient:
-    """
-    Copernicus Data Space Ecosystem (CDSE) の STAC API を叩いて
-    Sentinel-1 GRD シーンを検索するクライアント。
-
-    - 認証: OAuth2 client_credentials
-    - カタログ: https://stac.dataspace.copernicus.eu/v1/search
-      (settings.CDSE_STAC_URL にこの URL を設定しておく)
-    """
+    """ Copernicus Data Space Ecosystem (CDSE) Client """
 
     def __init__(self, session: Optional[requests.Session] = None) -> None:
         self._session = session or requests.Session()
-
         self._token_url = settings.CDSE_TOKEN_URL
         self._client_id = settings.CDSE_CLIENT_ID
         self._client_secret = settings.CDSE_CLIENT_SECRET
-
-        # settings.CDSE_STAC_URL は search のフルURLを期待
-        # 例: https://stac.dataspace.copernicus.eu/v1/search
         self._stac_search_url = settings.CDSE_STAC_URL.rstrip("/")
-
-        # アクセストークンキャッシュ
+        
         self._access_token: Optional[str] = None
         self._token_expire_at: datetime = datetime.min.replace(tzinfo=timezone.utc)
 
-    # ------------------------------------------------------------------
-    # 認証関連
-    # ------------------------------------------------------------------
     def _get_token(self) -> str:
         now = datetime.now(timezone.utc)
         if self._access_token and now < self._token_expire_at:
             return self._access_token
 
         if not self._client_id or not self._client_secret:
-            raise RuntimeError("CDSE_CLIENT_ID / CDSE_CLIENT_SECRET が設定されていません。")
+            return ""
 
         data = {
             "grant_type": "client_credentials",
@@ -85,232 +57,275 @@ class S1CDSEClient:
             "client_secret": self._client_secret,
         }
 
-        resp = self._session.post(self._token_url, data=data, timeout=30)
         try:
+            resp = self._session.post(self._token_url, data=data, timeout=30)
             resp.raise_for_status()
-        except Exception:
-            logger.error("CDSE token取得に失敗: %s", resp.text[:500])
-            raise
-
-        j = resp.json()
-        access_token = j["access_token"]
-        expires_in = int(j.get("expires_in", 3600))
-
-        # 有効期限の少し前に再取得するようにしておく
-        self._access_token = access_token
-        self._token_expire_at = now + timedelta(seconds=expires_in - 60)
-
-        logger.debug("CDSE token を取得しました (expires_in=%s sec)", expires_in)
-        return access_token
+            j = resp.json()
+            access_token = j["access_token"]
+            expires_in = int(j.get("expires_in", 3600))
+            self._access_token = access_token
+            self._token_expire_at = now + timedelta(seconds=expires_in - 60)
+            return access_token
+        except Exception as e:
+            logger.error(f"Failed to get CDSE token: {e}")
+            return ""
 
     def _auth_headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._get_token()}",
-            "Accept": "application/json",
-        }
+        token = self._get_token()
+        if token:
+            return {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+        return {"Accept": "application/json"}
 
-    # ------------------------------------------------------------------
-    # STAC 検索（GET /v1/search?bbox=...&datetime=...）
-    # ------------------------------------------------------------------
     def _stac_search(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        STAC /search を GET で叩く薄いラッパ。
-        params はそのままクエリパラメータになる。
-        """
-        logger.debug("STAC search params: %s", params)
-
-        resp = self._session.get(
-            self._stac_search_url,
-            headers=self._auth_headers(),
-            params=params,
-            timeout=60,
-        )
-        if resp.status_code >= 400:
-            logger.error(
-                "STAC search failed: %s %s",
-                resp.status_code,
-                resp.text[:800],
+        try:
+            resp = self._session.get(
+                self._stac_search_url,
+                headers=self._auth_headers(),
+                params=params,
+                timeout=60,
             )
             resp.raise_for_status()
-
-        return resp.json()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"STAC search error: {e}")
+            return {}
 
     @staticmethod
     def _parse_datetime(dt_str: str) -> datetime:
-        """
-        STAC の datetime (例: '2020-02-18T19:44:09Z') を datetime に変換。
-        """
-        # Python の fromisoformat は 'Z' を直接読めないので +00:00 に置換
         if dt_str.endswith("Z"):
             dt_str = dt_str.replace("Z", "+00:00")
+        if "." in dt_str:
+             main, frac = dt_str.split(".", 1)
+             if "+" in frac:
+                 frac, tz = frac.split("+", 1)
+                 tz = "+" + tz
+             else:
+                 tz = ""
+             dt_str = f"{main}.{frac[:6]}{tz}"
         return datetime.fromisoformat(dt_str)
 
     def _features_to_scenes(self, data: Dict[str, Any]) -> List[S1Scene]:
         scenes: List[S1Scene] = []
-
         for feat in data.get("features", []):
             props = feat.get("properties", {}) or {}
-
-            # 1) 観測日時を決定
-            dt_str = (
-                props.get("datetime")
-                or props.get("start_datetime")
-                or props.get("end_datetime")
-            )
-            if not dt_str:
-                continue
-
-            acq_time = self._parse_datetime(dt_str)
-
-            # 2) SAFE のプロダクト名（本物の L1 GRD）を取得
-            #    CDSE の STAC では `s1:product_identifier` に入っている想定
+            
+            dt_str = (props.get("datetime") or props.get("start_datetime") or props.get("end_datetime"))
+            if not dt_str: continue
+            
             product_identifier = (
-                props.get("s1:product_identifier")
-                or props.get("s1:productIdentifier")
+                props.get("s1:product_identifier") 
+                or props.get("productIdentifier")
+                or props.get("identifier")
             )
 
-            # 3) 製品タイプ (GRD 等)
-            product_type = (
-                props.get("s1:product_type")
-                or props.get("sar:product_type")
-                or props.get("productType")
-            )
-
-            scenes.append(
-                S1Scene(
-                    stac_id=feat.get("id", ""),  # 例: ..._COG
-                    product_identifier=product_identifier,  # 例: ...C8CD.SAFE
-                    acquisition_time=acq_time,
-                    orbit_direction=props.get("sat:orbit_state")
-                    or props.get("s1:orbitDirection")
-                    or props.get("orbitDirection"),
-                    relative_orbit=props.get("s1:relativeOrbitNumber")
-                    or props.get("sat:relative_orbit"),
-                    platform=props.get("platform")
-                    or props.get("platformSerialIdentifier"),
-                    product_type=product_type,
-                    geometry=feat.get("geometry") or {},
-                    properties=props,
-                )
-            )
-
-        # 時系列順でソート
+            scenes.append(S1Scene(
+                stac_id=feat.get("id", ""),
+                product_identifier=product_identifier,
+                acquisition_time=self._parse_datetime(dt_str),
+                orbit_direction=props.get("sat:orbit_state") or props.get("s1:orbitDirection") or props.get("orbitDirection"),
+                relative_orbit=props.get("s1:relativeOrbitNumber") or props.get("sat:relative_orbit"),
+                platform=props.get("platform") or props.get("platformSerialIdentifier"),
+                product_type=props.get("s1:product_type") or props.get("productType"),
+                geometry=feat.get("geometry") or {},
+                properties=props,
+                assets=feat.get("assets", {})
+            ))
         scenes.sort(key=lambda s: s.acquisition_time)
         return scenes
 
-    # ------------------------------------------------------------------
-    # ユーティリティ: 点 + 時間範囲で Sentinel-1 GRD を検索
-    # ------------------------------------------------------------------
     def search_grd_point_time(
-        self,
-        lat: float,
-        lon: float,
-        start: datetime,
-        end: datetime,
+        self, 
+        lat: float, 
+        lon: float, 
+        start: datetime, 
+        end: datetime, 
         limit: int = 100,
-        bbox_margin_deg: float = 0.2,
+        platform: Optional[str] = None,
+        orbit_direction: Optional[str] = None,
+        relative_orbit: Optional[int] = None
     ) -> List[S1Scene]:
-        """
-        指定した点 (lat, lon) を含む bbox と時間範囲で
-        Sentinel-1 GRD (sentinel-1-grd) を検索する。
-
-        - bbox は (lon±bbox_margin, lat±bbox_margin) の矩形
-        - instrument_mode=IW だけに絞っている
-        """
-
-        if start.tzinfo is None or start.tzinfo.utcoffset(start) is None:
-            raise ValueError("start は timezone-aware (UTC) にしてください")
-        if end.tzinfo is None or end.tzinfo.utcoffset(end) is None:
-            raise ValueError("end は timezone-aware (UTC) にしてください")
-
-        lon_min = lon - bbox_margin_deg
-        lon_max = lon + bbox_margin_deg
-        lat_min = lat - bbox_margin_deg
-        lat_max = lat + bbox_margin_deg
-
-        dt_range = (
-            start.isoformat().replace("+00:00", "Z")
-            + "/"
-            + end.isoformat().replace("+00:00", "Z")
-        )
-
-        params: Dict[str, Any] = {
-            # STAC コレクション ID
+        if start.tzinfo is None: start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None: end = end.replace(tzinfo=timezone.utc)
+        
+        bbox = f"{lon-0.1},{lat-0.1},{lon+0.1},{lat+0.1}"
+        dt_range = f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+        
+        params = {
             "collections": "sentinel-1-grd",
-            # lon_min, lat_min, lon_max, lat_max
-            "bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}",
-            # 時間範囲
+            "bbox": bbox,
             "datetime": dt_range,
-            # 返すアイテム数
             "limit": limit,
-            # Sentinel-1 IW モード限定
             "sar:instrument_mode": "IW",
-            # 必要なら極化も絞れる（ここでは VV/VH を優先）
             "sar:polarizations": "VV,VH",
         }
+        
+        if platform:
+            params["platform"] = platform
+        if orbit_direction:
+            params["sat:orbit_state"] = orbit_direction.lower()
+        if relative_orbit is not None:
+            params["sat:relative_orbit"] = relative_orbit
 
         data = self._stac_search(params)
         scenes = self._features_to_scenes(data)
-        logger.info(
-            "STAC search result: %d scenes (lat=%.3f, lon=%.3f, %s)",
-            len(scenes),
-            lat,
-            lon,
-            dt_range,
-        )
-        return scenes
 
-    # ------------------------------------------------------------------
-    # 後続で使う: 「降雨イベントの後の最初のシーン」と「直前シーン」
-    # ------------------------------------------------------------------
-    def find_after_scene(
-        self,
-        lat: float,
-        lon: float,
-        event_end_utc: datetime,
-        after_hours: float,
-    ) -> Optional[S1Scene]:
-        """
-        降雨イベント終了時刻 event_end_utc から after_hours 時間の範囲で
-        最初に取得される Sentinel-1 GRD シーンを返す。
-        """
+        filtered_scenes = []
+        for s in scenes:
+            # Platform厳密チェック
+            if platform:
+                p_req = platform.lower().replace("-", "")
+                p_act = (s.platform or "").lower().replace("-", "")
+                if p_req not in p_act and p_act not in p_req:
+                    continue
+            
+            # Orbit Direction厳密チェック
+            if orbit_direction:
+                o_req = orbit_direction.lower()
+                o_act = (s.orbit_direction or "").lower()
+                if o_req != o_act:
+                    continue
+                
+            # Relative Orbit厳密チェック
+            if relative_orbit is not None:
+                if s.relative_orbit != relative_orbit:
+                    continue
+            
+            filtered_scenes.append(s)
+            
+        return filtered_scenes
 
+    def find_after_scene(self, lat: float, lon: float, event_end_utc: datetime, after_hours: float) -> Optional[S1Scene]:
         start = event_end_utc
         end = event_end_utc + timedelta(hours=after_hours)
-
-        scenes = self.search_grd_point_time(lat, lon, start, end, limit=100)
+        scenes = self.search_grd_point_time(lat, lon, start, end)
         for s in scenes:
             if s.acquisition_time >= event_end_utc:
                 return s
         return None
 
     def find_before_scene_unbounded(
-        self,
-        lat: float,
-        lon: float,
+        self, 
+        lat: float, 
+        lon: float, 
         ref_time_utc: datetime,
-        mission_start_utc: datetime | None = None,
+        platform: Optional[str] = None,
+        orbit_direction: Optional[str] = None,
+        relative_orbit: Optional[int] = None
     ) -> Optional[S1Scene]:
         """
-        ref_time_utc より前で「一番直近」の Sentinel-1 GRD シーンを返す。
-        時間制限なし（ミッション開始から全部見る）。
-
-        mission_start_utc を省略した場合は 2014-01-01 をデフォルトにする。
+        指定された条件 (Platform, Orbit等) に合致する、ref_time_utc より前の「直近」のシーンを探す。
+        APIのlimit制限を回避するため、期間を区切って段階的に過去へ遡る。
         """
+        
+        # 検索範囲のステップ (日): 1ヶ月 -> 3ヶ月 -> 1年 -> 5年 -> 全期間
+        lookback_steps = [30, 90, 365, 365*5, 365*10]
+        
+        for days_back in lookback_steps:
+            start = ref_time_utc - timedelta(days=days_back)
+            
+            # ref_time_utc までを検索 (limit=200あれば、30日分なら十分入るはず)
+            scenes = self.search_grd_point_time(
+                lat, lon, start, ref_time_utc, 
+                limit=200,
+                platform=platform,
+                orbit_direction=orbit_direction,
+                relative_orbit=relative_orbit
+            )
+            
+            # 条件に合い、かつ ref_time より前のもの
+            before_candidates = [s for s in scenes if s.acquisition_time < ref_time_utc]
+            
+            if before_candidates:
+                # 見つかった中で最も新しいもの（直近）を返す
+                return max(before_candidates, key=lambda s: s.acquisition_time)
+            
+            # 見つからなければループ継続（検索範囲を広げる）
+            # logger.debug(f"No before scene found within {days_back} days. Extending search...")
 
-        if mission_start_utc is None:
-            mission_start_utc = datetime(2014, 1, 1, tzinfo=timezone.utc)
+        return None
 
-        scenes = self.search_grd_point_time(
-            lat,
-            lon,
-            mission_start_utc,
-            ref_time_utc,
-            limit=200,  # 必要に応じて増やせる
-        )
+    # ... (ダウンロード系メソッドは変更なし) ...
+    def _normalize_product_name(self, name: str) -> str:
+        if name.endswith("_COG"):
+            name = name[:-4]
+        if name.endswith(".SAFE"):
+            name = name[:-5]
+        return name
 
-        before = [s for s in scenes if s.acquisition_time < ref_time_utc]
-        if not before:
+    def _get_odata_id_by_name(self, product_name: str) -> Optional[str]:
+        name_stem = self._normalize_product_name(product_name)
+        url = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+        
+        filter_exact = f"Name eq '{name_stem}.SAFE' or Name eq '{name_stem}'"
+        filter_fuzzy = f"contains(Name, '{name_stem}')"
+
+        for filter_query in [filter_exact, filter_fuzzy]:
+            params = {
+                "$filter": filter_query,
+                "$top": 1,
+                "$orderby": "ContentDate/Start desc"
+            }
+            try:
+                resp = self._session.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+                values = resp.json().get("value", [])
+                if values:
+                    return values[0].get("Id")
+            except Exception:
+                continue
+        
+        logger.error(f"OData product not found for: {product_name}")
+        return None
+
+    def download_product(self, product_identifier: str, output_dir: Path, progress_callback: Optional[Callable[[int, int], bool]] = None) -> Optional[Path]:
+        if not product_identifier:
             return None
-        # ref_time_utc に最も近い過去のシーン
-        return max(before, key=lambda s: s.acquisition_time)
+        
+        if not self._get_token():
+            logger.error("Cannot download: No CDSE credentials provided.")
+            return None
+
+        uuid = self._get_odata_id_by_name(product_identifier)
+        if not uuid:
+            return None
+
+        download_url = f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({uuid})/$value"
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = self._normalize_product_name(product_identifier) + ".zip"
+        save_path = output_dir / safe_name
+
+        if save_path.exists() and save_path.stat().st_size > 0:
+            logger.info(f"Skipping existing file: {save_path}")
+            if progress_callback:
+                progress_callback(100, 100)
+            return save_path
+
+        logger.info(f"Downloading to: {save_path}")
+        try:
+            with self._session.get(download_url, headers=self._auth_headers(), stream=True, timeout=120) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                
+                with open(save_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback and total_size > 0:
+                                if progress_callback(downloaded, total_size) is False:
+                                    raise InterruptedError("Cancelled")
+                                
+            return save_path
+        except InterruptedError:
+            logger.info(f"Download cancelled: {safe_name}")
+            if save_path.exists(): save_path.unlink()
+            return None
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            if save_path.exists(): save_path.unlink()
+            return None

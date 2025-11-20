@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
 from app.db import models
+from app.utils.japan import point_within_japan
 
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,17 @@ def backfill_grid_ids(batch_size: int = 1000, dry_run: bool = False) -> None:
                 .values(grid_id=gid)
             )
             result = session.execute(stmt)
+
+            is_land = point_within_japan(lat, lon)
+            session.merge(
+                models.GsmapGrid(
+                    grid_id=gid,
+                    lat=lat,
+                    lon=lon,
+                    is_japan_land=is_land,
+                    region="Japan" if is_land else None,
+                )
+            )
             processed += 1
 
             if processed % batch_size == 0:

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.dependencies.db import get_db
 from app.db import models
-from app.api import s1_pairs
+from app.api import s1_pairs, gsmap, grids
 
 app = FastAPI(title="RainSAR Hub API")
 
@@ -22,6 +22,8 @@ app.add_middleware(
 )
 
 app.include_router(s1_pairs.router, tags=["s1-pairs"])
+app.include_router(grids.router, tags=["grids"])
+app.include_router(gsmap.router)
 
 
 @app.get("/health")

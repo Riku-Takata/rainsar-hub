@@ -1,5 +1,6 @@
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Enum,
@@ -7,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     ForeignKey,
+    func,
 )
 from app.db.base import Base
 
@@ -23,6 +25,18 @@ class GsmapPoint(Base):
     region = Column(String(32), nullable=True)  # 'Japan' など
     grid_id = Column(String(32), nullable=True)
     source_file = Column(String(128), nullable=True)
+
+class GsmapGrid(Base):
+    __tablename__ = "gsmap_grids"
+
+    grid_id = Column(String(32), primary_key=True)
+    lat = Column(Float, nullable=False)
+    lon = Column(Float, nullable=False)
+    is_japan_land = Column(Boolean, nullable=False, server_default="0")
+    region = Column(String(32), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
 
     # 追加のインデックスは Alembic の自動生成に任せる
 
@@ -60,19 +74,17 @@ class GsmapEvent(Base):
     # 代表するソースファイル（最大雨量時など）
     repr_source_file = Column(String(255), nullable=True)
 
-class RainEvent(Base):
-    __tablename__ = "rain_events"
+class JapanGrid(Base):
+    """
+    日本国土に含まれるメッシュ（Grid）のユニークなリスト。
+    地図上の初期プロットに使用する。
+    """
+    __tablename__ = "japan_grids"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    ts_utc = Column(DateTime, nullable=False, index=True)
+    grid_id = Column(String(32), nullable=False, unique=True, index=True)
     lat = Column(Float, nullable=False)
     lon = Column(Float, nullable=False)
-    gauge_mm_h = Column(Float, nullable=False)
-    grid_id = Column(String(32), nullable=True)
-    type = Column(
-        Enum("rain10_30", "clear0", name="rain_event_type"),
-        nullable=False,
-    )
 
 class S1Pair(Base):
     """
