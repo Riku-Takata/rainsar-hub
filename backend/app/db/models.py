@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     ForeignKey,
     func,
+    JSON,
 )
 from app.db.base import Base
 
@@ -53,6 +54,9 @@ class GsmapEvent(Base):
 
     id = Column(BigInteger, primary_key=True, index=True)
 
+    # グリッドID (検索・結合用)
+    grid_id = Column(String(32), index=True, nullable=False)
+
     # 空間
     lat = Column(Float, index=True, nullable=False)
     lon = Column(Float, index=True, nullable=False)
@@ -73,6 +77,9 @@ class GsmapEvent(Base):
 
     # 代表するソースファイル（最大雨量時など）
     repr_source_file = Column(String(255), nullable=True)
+    
+    # 詳細な時系列データなどを保持する場合
+    rainfall_data = Column(JSON, nullable=True)
 
 class JapanGrid(Base):
     """

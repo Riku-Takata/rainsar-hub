@@ -1,4 +1,4 @@
-mer```mermaid
+```mermaid
 erDiagram
     %% マスターデータ: グリッド定義
     gsmap_grids {

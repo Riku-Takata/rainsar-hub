@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 import shutil
 import logging
+import time
+import random  # ★追加
 import requests
 
 from app.core.config import settings
@@ -80,18 +82,50 @@ class S1CDSEClient:
         return {"Accept": "application/json"}
 
     def _stac_search(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            resp = self._session.get(
-                self._stac_search_url,
-                headers=self._auth_headers(),
-                params=params,
-                timeout=60,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"STAC search error: {e}")
-            return {}
+        # ★修正: リトライロジックの強化
+        max_retries = 10  # 回数を増やす
+        base_wait = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                resp = self._session.get(
+                    self._stac_search_url,
+                    headers=self._auth_headers(),
+                    params=params,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            
+            except requests.exceptions.HTTPError as e:
+                # 429 Too Many Requests の場合
+                if e.response is not None and e.response.status_code == 429:
+                    # Retry-After ヘッダーがあれば従う
+                    retry_after = e.response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait_time = float(retry_after) + 1.0 # 念のため+1秒
+                        except ValueError:
+                            wait_time = base_wait * (2 ** attempt)
+                    else:
+                        # 指数バックオフ + Jitter (ゆらぎ)
+                        # Jitterを入れることで、並列スレッドが一斉にリトライして再度刺さるのを防ぐ
+                        wait_time = base_wait * (2 ** attempt) + (random.random() * 3.0)
+                    
+                    logger.warning(f"Rate limit hit (429). Retrying in {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                
+                # 5xx 系エラーも一時的ならリトライしてもよいが、今回はログを出して終了
+                logger.error(f"STAC search error: {e}")
+                return {}
+            
+            except Exception as e:
+                logger.error(f"STAC search error: {e}")
+                return {}
+        
+        logger.error("STAC search failed after max retries.")
+        return {}
 
     @staticmethod
     def _parse_datetime(dt_str: str) -> datetime:

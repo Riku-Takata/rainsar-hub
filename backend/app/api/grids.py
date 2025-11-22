@@ -74,17 +74,22 @@ cancellation_requests: Set[str] = set()
 
 @router.get("/grids/stats", response_model=List[GridStatResponse])
 def get_grid_stats(min_rain: float = 1.0, db: Session = Depends(get_db)):
+    """
+    グリッドごとの雨量統計（降雨時間合計）を返す。
+    高速化のため、数百万件の GsmapPoint ではなく、集約済みの GsmapEvent を使用する。
+    """
+    # GsmapEvent (軽量) を結合して hit_hours (降雨時間) を合計する
     stmt = (
         db.query(
             models.JapanGrid.grid_id,
             models.JapanGrid.lat,
             models.JapanGrid.lon,
-            func.count(models.GsmapPoint.id).label("rain_point_count")
+            func.coalesce(func.sum(models.GsmapEvent.hit_hours), 0).label("rain_point_count")
         )
         .outerjoin(
-            models.GsmapPoint,
-            (models.JapanGrid.grid_id == models.GsmapPoint.grid_id) & 
-            (models.GsmapPoint.gauge_mm_h >= min_rain)
+            models.GsmapEvent,
+            (models.JapanGrid.grid_id == models.GsmapEvent.grid_id) &
+            (models.GsmapEvent.max_gauge_mm_h >= min_rain)
         )
         .group_by(models.JapanGrid.grid_id, models.JapanGrid.lat, models.JapanGrid.lon)
     )
