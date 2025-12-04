@@ -4,8 +4,9 @@ WORKDIR /app
 
 # MySQL クライアント & ビルドツール（必要に応じて）
 RUN apt-get update && apt-get install -y \
-    build-essential default-libmysqlclient-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+  build-essential default-libmysqlclient-dev pkg-config \
+  libexpat1 \
+  && rm -rf /var/lib/apt/lists/*
 
 # ここから下は "context: ../backend" を前提に、
 # backend ディレクトリ直下のファイルとして扱う

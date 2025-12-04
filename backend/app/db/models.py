@@ -92,6 +92,8 @@ class JapanGrid(Base):
     grid_id = Column(String(32), nullable=False, unique=True, index=True)
     lat = Column(Float, nullable=False)
     lon = Column(Float, nullable=False)
+    is_rice_paddy = Column(Boolean, nullable=False, server_default="0")
+    is_highway = Column(Boolean, nullable=False, server_default="0")
 
 class S1Pair(Base):
     """

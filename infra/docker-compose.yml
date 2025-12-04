@@ -47,6 +47,10 @@ services:
       - type: bind
         source: ${S1_SAMPLE_ROOT}
         target: /data/s1_samples
+      - type: bind
+        source: ${JAXA_DATA_ROOT}
+        target: /data/jaxa
+        read_only: true
 
   adminer:
     image: adminer
