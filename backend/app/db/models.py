@@ -136,3 +136,46 @@ class S1Pair(Base):
 
     # データソース識別（"cdse" など）
     source = Column(String(32), nullable=False, default="cdse")
+
+class FudePolygon(Base):
+    """
+    田んぼの筆ポリゴンの情報を格納した元データ
+    """
+    __tablename__ = "fude_polygons"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    polygon_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    land_type = Column(Integer, nullable=True)
+    issue_year = Column(Integer, nullable=True)
+    edit_year = Column(Integer, nullable=True)
+    history = Column(String(512), nullable=True)
+    last_polygon_uuid = Column(String(64), nullable=True)
+    prev_last_polygon_uuid = Column(String(64), nullable=True)
+    local_government_cd = Column(String(32), index=True, nullable=True)
+    point_lng = Column(Float, nullable=True)
+    point_lat = Column(Float, nullable=True)
+    old_polygon_id = Column(String(64), nullable=True)
+
+    # 検索を効率化するため、都道府県IDを持たせる（ファイル名由来など）
+    pref_id = Column(String(2), index=True, nullable=False)
+    # GeoJSONのgeometryを保存
+    geometry = Column(JSON, nullable=False)
+
+class RoadPolygon(Base):
+    """
+    道路ポリゴン(LineStringなど)の情報を格納した元データ
+    """
+    __tablename__ = "road_polygons"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    n13_001 = Column(String(32), nullable=True)
+    n13_002 = Column(String(32), nullable=True)
+    n13_003 = Column(String(32), nullable=True)
+    n13_004 = Column(String(32), nullable=True)
+    n13_005 = Column(Integer, nullable=True)
+    n13_006 = Column(String(32), index=True, nullable=True)
+    n13_007 = Column(String(32), nullable=True)
+    n13_008 = Column(String(32), nullable=True)
+
+    # GeoJSONのgeometryを保存
+    geometry = Column(JSON, nullable=False)

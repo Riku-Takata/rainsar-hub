@@ -170,6 +170,37 @@ class S1CDSEClient:
         scenes.sort(key=lambda s: s.acquisition_time)
         return scenes
 
+    def search_grd_bbox_time(
+        self,
+        min_lat: float,
+        max_lat: float,
+        min_lon: float,
+        max_lon: float,
+        start: datetime,
+        end: datetime,
+        limit: int = 100,
+    ) -> List[S1Scene]:
+        """bbox 範囲全体で Sentinel-1 IW GRD を検索する。"""
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        bbox = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+        dt_range = f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+
+        params = {
+            "collections": "sentinel-1-grd",
+            "bbox": bbox,
+            "datetime": dt_range,
+            "limit": limit,
+            "sar:instrument_mode": "IW",
+            "sar:polarizations": "VV,VH",
+        }
+
+        data = self._stac_search(params)
+        return self._features_to_scenes(data)
+
     def search_grd_point_time(
         self, 
         lat: float, 
@@ -281,7 +312,14 @@ class S1CDSEClient:
 
         return None
 
-    # ... (ダウンロード系メソッドは変更なし) ...
+    @staticmethod
+    def _ensure_utc(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _format_dt_range(start: datetime, end: datetime) -> str:
+        return f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+
     def _normalize_product_name(self, name: str) -> str:
         if name.endswith("_COG"):
             name = name[:-4]
@@ -326,7 +364,7 @@ class S1CDSEClient:
         if not uuid:
             return None
 
-        download_url = f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({uuid})/$value"
+        download_url = f"https://download.dataspace.copernicus.eu/odata/v1/Products({uuid})/$value"
         
         output_dir.mkdir(parents=True, exist_ok=True)
         safe_name = self._normalize_product_name(product_identifier) + ".zip"
@@ -353,13 +391,106 @@ class S1CDSEClient:
                             if progress_callback and total_size > 0:
                                 if progress_callback(downloaded, total_size) is False:
                                     raise InterruptedError("Cancelled")
-                                
             return save_path
-        except InterruptedError:
-            logger.info(f"Download cancelled: {safe_name}")
+        except Exception as e:
+            logger.error(f"Download failed for {download_url}: {e}")
             if save_path.exists(): save_path.unlink()
             return None
+
+
+class S2CDSEClient(S1CDSEClient):
+    """ Sentinel-2 Client extending S1CDSEClient """
+    
+    def search_sentinel2(
+        self,
+        lat: float,
+        lon: float,
+        start: datetime,
+        end: datetime,
+        limit: int = 20,
+        max_cloud_cover: int = 10
+    ) -> List[S1Scene]:
+        """
+        Sentinel-2 L2A Scenes Search
+        """
+        if start.tzinfo is None: start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None: end = end.replace(tzinfo=timezone.utc)
+        
+        bbox = f"{lon-0.05},{lat-0.05},{lon+0.05},{lat+0.05}"
+        dt_range = f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+        
+        params = {
+            "collections": "sentinel-2-l2a",
+            "bbox": bbox,
+            "datetime": dt_range,
+            "limit": limit,
+            "eo:cloud_cover": f"0/{max_cloud_cover}",  # Range query
+        }
+
+        data = self._stac_search(params)
+        scenes = self._features_to_scenes(data)
+        scenes.sort(key=lambda s: (s.properties.get("eo:cloud_cover", 100), s.acquisition_time), reverse=False)
+        return scenes
+
+    def download_file_from_url(self, url: str, save_path: Path) -> Optional[Path]:
+        """
+        Download a file from a direct URL (e.g., STAC Asset Href).
+        If S3 URL, converts to OData API URL to use OAuth token.
+        """
+        if not self._get_token():
+            logger.error("Cannot download: No CDSE credentials provided.")
+            return None
+
+        # Convert S3 to OData if needed
+        if url.startswith("s3://"):
+             if ".SAFE" in url:
+                 try:
+                     safe_part = url.split(".SAFE")[0] + ".SAFE"
+                     product_name = safe_part.split("/")[-1]
+                     rel_path = url.split(".SAFE")[1]
+                     rel_parts = [p for p in rel_path.split("/") if p]
+                     
+                     uuid = self._get_odata_id_by_name(product_name)
+                     if not uuid:
+                         logger.error(f"Could not find OData UUID for {product_name}")
+                         return None
+                     
+                     # Construct OData URL
+                     # https://zipper.dataspace.copernicus.eu/odata/v1/Products(uuid)/Nodes(folder)/Nodes(file)/$value
+                     
+                     # Start with first relative folder (e.g. GRANULE)
+                     # Product(uuid) is already the root.
+                     nodes_chain = ""
+                     for i, part in enumerate(rel_parts):
+                         if i == 0:
+                             nodes_chain += f"Nodes('{part}')"
+                         else:
+                             nodes_chain += f"/Nodes('{part}')"
+                     
+                     url = f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({uuid})/{nodes_chain}/$value"
+                     logger.info(f"Converted S3 URL to OData: {url}")
+                 except Exception as e:
+                     logger.error(f"Failed to parse S3 URL {url}: {e}")
+                     return None
+             else:
+                 logger.warning(f"URL does not contain .SAFE, cannot derive OData path: {url}")
+                 return None
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if save_path.exists() and save_path.stat().st_size > 0:
+            logger.info(f"Skipping existing file: {save_path.name}")
+            return save_path
+
+        logger.info(f"Downloading to: {save_path.name}")
+        try:
+            with self._session.get(url, headers=self._auth_headers(), stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            return save_path
         except Exception as e:
-            logger.error(f"Download failed: {e}")
+            logger.error(f"Download failed for {url}: {e}")
             if save_path.exists(): save_path.unlink()
             return None

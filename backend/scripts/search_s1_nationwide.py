@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -156,6 +157,7 @@ def process_grid_batch(
     # 全イベントについて検索を実行
     for ev in events:
         pair = search_event_pair(ev, search_window_hours, client)
+        time.sleep(0.5)
         if pair:
             found_pairs.append(pair)
             # 判定条件: 1つでも trigger_hours 以内のデータがあれば合格
@@ -174,9 +176,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trigger-hours", type=float, default=2.0, help="Gridを採用する判定基準となる経過時間 (default: 2.0h)")
     parser.add_argument("--search-window", type=float, default=24.0, help="検索を行う最大時間幅 (default: 24.0h)")
-    parser.add_argument("--workers", type=int, default=8, help="並列実行数 (default: 8)")
+    parser.add_argument("--workers", type=int, default=2, help="並列実行数 (default: 2)")
     parser.add_argument("--min-rain", type=float, default=4.0, help="対象とする最小最大雨量 (default: 4.0)")
     parser.add_argument("--limit-grids", type=int, default=0, help="処理するGrid数の上限 (テスト用, 0=無制限)")
+    parser.add_argument("--grid-csv", type=str, default=None, help="対象GridリストCSV (GridID列必須)")
     
     args = parser.parse_args()
 
@@ -190,10 +193,26 @@ def main():
     
     try:
         # 1. 全イベントを取得してメモリ上でグルーピング
+        
+        target_grids = None
+        if args.grid_csv:
+            import pandas as pd
+            df_g = pd.read_csv(args.grid_csv)
+            if "GridID" in df_g.columns:
+                target_grids = df_g["GridID"].tolist()
+                logger.info(f"Targeting {len(target_grids)} grids from CSV.")
+            else:
+                logger.error("CSV must have 'GridID' column.")
+                return
+
         logger.info(f"Fetching events (rain >= {args.min_rain} mm/h)...")
         query = db_read.query(models.GsmapEvent).filter(
             models.GsmapEvent.max_gauge_mm_h >= args.min_rain
         )
+        
+        if target_grids:
+            query = query.filter(models.GsmapEvent.grid_id.in_(target_grids))
+            
         all_events = query.all()
         
         # Gridごとに整理

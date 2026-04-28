@@ -72,7 +72,7 @@ def process_one(
     out_file: Path,
     aoi_wkt: str,
     pixel_spacing: float = 10.0,
-    pol: str = "VH",
+    pol: str = "VV",
 ):
     """
     1シーン分を前処理して、AOI 部分のみの dB GeoTIFF を出力。
@@ -191,7 +191,7 @@ def main():
     parser.add_argument("--out-root", type=str, default=r"D:\sotsuron\s1_samples")
     parser.add_argument("--pixel-spacing", type=float, default=10.0)
     parser.add_argument("--grid-size", type=float, default=0.1)
-    parser.add_argument("--pol", type=str, default="VH", choices=["VV", "VH"])
+    parser.add_argument("--pol", type=str, default="VV", choices=["VV", "VH"])
 
     args = parser.parse_args()
     in_path = Path(args.in_root)
