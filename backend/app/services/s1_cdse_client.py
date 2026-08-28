@@ -11,6 +11,7 @@ import logging
 import time
 import random  # ★追加
 import requests
+import zipfile
 
 from app.core.config import settings
 
@@ -38,6 +39,8 @@ class S1CDSEClient:
     def __init__(self, session: Optional[requests.Session] = None) -> None:
         self._session = session or requests.Session()
         self._token_url = settings.CDSE_TOKEN_URL
+        self._username = settings.CDSE_USERNAME
+        self._password = settings.CDSE_PASSWORD
         self._client_id = settings.CDSE_CLIENT_ID
         self._client_secret = settings.CDSE_CLIENT_SECRET
         self._stac_search_url = settings.CDSE_STAC_URL.rstrip("/")
@@ -50,27 +53,37 @@ class S1CDSEClient:
         if self._access_token and now < self._token_expire_at:
             return self._access_token
 
-        if not self._client_id or not self._client_secret:
-            return ""
+        auth_attempts: List[Dict[str, str]] = []
+        if self._username and self._password:
+            auth_attempts.append({
+                "grant_type": "password",
+                "client_id": "cdse-public",
+                "username": self._username,
+                "password": self._password,
+            })
+        if self._client_id and self._client_secret:
+            auth_attempts.append({
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+            })
 
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-        }
+        for data in auth_attempts:
+            grant_type = data["grant_type"]
+            try:
+                resp = self._session.post(self._token_url, data=data, timeout=30)
+                resp.raise_for_status()
+                j = resp.json()
+                access_token = j["access_token"]
+                expires_in = int(j.get("expires_in", 3600))
+                self._access_token = access_token
+                self._token_expire_at = now + timedelta(seconds=expires_in - 60)
+                logger.info(f"CDSE authentication succeeded ({grant_type})")
+                return access_token
+            except Exception as e:
+                logger.warning(f"CDSE authentication failed ({grant_type}): {e}")
 
-        try:
-            resp = self._session.post(self._token_url, data=data, timeout=30)
-            resp.raise_for_status()
-            j = resp.json()
-            access_token = j["access_token"]
-            expires_in = int(j.get("expires_in", 3600))
-            self._access_token = access_token
-            self._token_expire_at = now + timedelta(seconds=expires_in - 60)
-            return access_token
-        except Exception as e:
-            logger.error(f"Failed to get CDSE token: {e}")
-            return ""
+        return ""
 
     def _auth_headers(self) -> Dict[str, str]:
         token = self._get_token()
@@ -371,19 +384,25 @@ class S1CDSEClient:
         save_path = output_dir / safe_name
 
         if save_path.exists() and save_path.stat().st_size > 0:
-            logger.info(f"Skipping existing file: {save_path}")
-            if progress_callback:
-                progress_callback(100, 100)
-            return save_path
+            if zipfile.is_zipfile(save_path):
+                logger.info(f"Skipping existing file: {save_path}")
+                if progress_callback:
+                    progress_callback(100, 100)
+                return save_path
+            logger.warning(f"Removing incomplete zip file: {save_path}")
+            save_path.unlink()
 
         logger.info(f"Downloading to: {save_path}")
+        tmp_path = save_path.with_suffix(save_path.suffix + ".part")
+        if tmp_path.exists():
+            tmp_path.unlink()
         try:
             with self._session.get(download_url, headers=self._auth_headers(), stream=True, timeout=120) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
                 downloaded = 0
                 
-                with open(save_path, 'wb') as f:
+                with open(tmp_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
@@ -391,10 +410,11 @@ class S1CDSEClient:
                             if progress_callback and total_size > 0:
                                 if progress_callback(downloaded, total_size) is False:
                                     raise InterruptedError("Cancelled")
+            tmp_path.replace(save_path)
             return save_path
         except Exception as e:
             logger.error(f"Download failed for {download_url}: {e}")
-            if save_path.exists(): save_path.unlink()
+            if tmp_path.exists(): tmp_path.unlink()
             return None
 
 

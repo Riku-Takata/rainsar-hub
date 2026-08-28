@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     S1_SAMPLE_ROOT: str = "/data/s1_samples"
 
     # Copernicus Data Space (CDSE) 認証＆STAC
+    CDSE_USERNAME: str | None = None
+    CDSE_PASSWORD: str | None = None
     CDSE_CLIENT_ID: str | None = None
     CDSE_CLIENT_SECRET: str | None = None
     CDSE_TOKEN_URL: str = (

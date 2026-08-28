@@ -1,0 +1,17 @@
+name: shuron-mysql
+
+services:
+  db:
+    image: mysql:8
+    container_name: shuron-mysql-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rainsar_hub
+      MYSQL_USER: rainsar
+      MYSQL_PASSWORD: rainsar_pw
+    ports:
+      - "${DB_PORT_HOST:-3308}:3306"
+    volumes:
+      - type: bind
+        source: ${MYSQL_ROOT:-E:\shuron\mysql_data}
+        target: /var/lib/mysql
